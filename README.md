@@ -1,6 +1,6 @@
 # Microsoft Sentinel SOC Investigation & Detection Lab
 
-> I deployed an internet-exposed Windows Server VM on Azure to collect real security telemetry. Within hours a real external threat actor found it and launched a brute force attack. This documents the full investigation — from initial reconnaissance detection through threat intelligence confirmation — using Microsoft Sentinel, KQL, and live Azure infrastructure.
+> I deployed an internet-exposed Windows Server VM on Azure to collect real security telemetry. Within hours, real external threat actors found it and launched brute force attacks. This documents the full investigation — from initial telemetry through threat intelligence confirmation, layered detection engineering, and real-time monitoring — using Microsoft Sentinel, Microsoft Defender, and live Azure infrastructure.
 
 ---
 
@@ -16,10 +16,15 @@
 - [Phase 5 — Threat Intelligence Enrichment](#phase-5--threat-intelligence-enrichment)
 - [Phase 6 — Failed vs Successful Login Correlation](#phase-6--failed-vs-successful-login-correlation)
 - [Phase 7 — Logon Type Analysis](#phase-7--logon-type-analysis)
-- [Phase 8 — Detection Engineering](#phase-8--detection-engineering)
+- [Phase 8 — Detection Engineering (Defender)](#phase-8--detection-engineering-defender)
 - [Phase 9 — Incident Response & Triage](#phase-9--incident-response--triage)
 - [Phase 10 — Endpoint Threat Hunting](#phase-10--endpoint-threat-hunting)
+- [Phase 11 — Sentinel Analytics Rules](#phase-11--sentinel-analytics-rules)
+- [Phase 12 — Threat Intelligence Watchlist](#phase-12--threat-intelligence-watchlist)
+- [Phase 13 — Sentinel Workbook & Second Threat Actor Discovery](#phase-13--sentinel-workbook--second-threat-actor-discovery)
 - [Incident Report — IR-001](#incident-report--ir-001)
+- [Full Threat Actor Summary](#full-threat-actor-summary)
+- [Detection Program Summary](#detection-program-summary)
 - [What This Detection Misses](#what-this-detection-misses)
 - [Key Takeaways](#key-takeaways)
 
@@ -29,7 +34,7 @@
 
 This lab was built to simulate real Tier 1 SOC analyst workflows using Microsoft Sentinel and live Azure infrastructure. Unlike labs that use pre-packaged datasets, this environment was intentionally internet-exposed to collect authentic attack telemetry.
 
-What I didn't plan for — within hours of deployment, a real external threat actor found the VM and launched a brute force attack. This turned a learning exercise into a real investigation.
+What I didn't plan for — within hours of deployment, real external threat actors found the VM and launched brute force attacks. A Sentinel Workbook built later in the investigation surfaced a second threat actor that wasn't discovered during the initial investigation — proving the value of continuous monitoring and visualization.
 
 **What this lab demonstrates:**
 - Live Azure VM deployment and SIEM configuration
@@ -37,11 +42,14 @@ What I didn't plan for — within hours of deployment, a real external threat ac
 - Separating analyst-generated noise from real threat actor activity
 - Threat intelligence enrichment using AbuseIPDB
 - KQL-based detection engineering with MITRE ATT&CK mapping
+- Layered detection — fast attacks and low and slow attacks
+- Threat intelligence watchlist integration
+- Sentinel Workbook dashboard for real-time monitoring
 - Full incident response workflow from detection to closure
 - Endpoint threat hunting via process creation analysis
 
 **Timeframe:** May 4–8, 2026
-**Environment:** Azure (live, internet-exposed Windows Server VM)
+**Environment:** Azure — live, internet-exposed Windows Server VM
 **Tools:** Microsoft Sentinel, Microsoft Defender XDR, AbuseIPDB
 **Query Language:** KQL (Kusto Query Language)
 
@@ -70,7 +78,8 @@ One of the most important skills in SOC work is separating your own activity fro
 | Activity | Source IP | Logon Type | What it was |
 |---|---|---|---|
 | Analyst activity | 67.161.220.109 | Type 10 (RDP) | Me connecting to my VM via Windows Remote Desktop on my MacBook — including intentional failed logins during setup |
-| Real external attack | 45.142.193.145 | Type 3 (Network) | Automated brute force bot that found the internet-exposed VM |
+| Real external attack | 45.142.193.145 | Type 3 (Network) | Automated brute force bot — confirmed malicious |
+| Real external scan | 137.184.111.6 | Type 3 (Network) | BinaryEdge internet scanner — confirmed malicious |
 
 This separation was identified by running a combined IP and logon type query:
 
@@ -90,13 +99,13 @@ SecurityEvent
 | 67.161.220.109 | 3 | 3 |
 | 67.161.220.109 | 10 | 3 |
 
-The Type 10 failures from 67.161.220.109 were my own RDP sessions. The 55 Type 3 failures from 45.142.193.145 were real external attack traffic — nothing to do with me.
+The Type 10 failures from 67.161.220.109 were my own RDP sessions. The 55 Type 3 failures from 45.142.193.145 were real external attack traffic. The third IP (137.184.111.6) was surfaced later by the Sentinel Workbook.
 
 ---
 
 ## Phase 1 — Initial Telemetry Baseline
 
-**Objective:** Before investigating specific threats, establish what event types are present in the environment to understand the full picture of activity.
+**Objective:** Establish a baseline of what event types are present before investigating specific threats.
 
 ```kql
 SecurityEvent
@@ -113,15 +122,15 @@ SecurityEvent
 | 4627 | Group Membership Information | 15 |
 | 4624 | Successful Logon | 15 |
 | 4672 | Special Privileges Assigned | 15 |
-| 4625 | Failed Logon | (investigated below) |
+| 4625 | Failed Logon | Investigated below |
 
-**Analyst Note:** The volume of Event ID 4688 (process creation) warranted a separate endpoint investigation. The presence of 4672 alongside 4624 indicated privileged account logons that required correlation.
+**Analyst Note:** High volume of Event ID 4688 warranted a separate endpoint investigation. Presence of 4672 alongside 4624 indicated privileged account logons requiring correlation.
 
 ---
 
 ## Phase 2 — Failed Authentication Investigation
 
-**Objective:** Identify which accounts were being targeted and determine whether the pattern indicated automated tooling or manual attack activity.
+**Objective:** Identify which accounts were targeted and determine whether the pattern indicated automated tooling.
 
 ```kql
 SecurityEvent
@@ -141,13 +150,13 @@ SecurityEvent
 | socadmin | 12 | Lab account — specifically targeted |
 | Test | 2 | Common default account guess |
 
-**Key Finding:** Accounts named scanner, scans, and scan do not exist on this machine. Three non-existent accounts being targeted with identical attempt counts is a strong indicator of automated credential stuffing tooling cycling through a wordlist — not a human manually guessing passwords.
+**Key Finding:** Accounts named scanner, scans, and scan do not exist on this machine. Three non-existent accounts targeted with identical attempt counts is a strong indicator of automated credential stuffing tooling cycling through a wordlist.
 
 ---
 
 ## Phase 3 — Attack Timeline Analysis
 
-**Objective:** Understand exactly when the attack started, how it evolved, and what the timing pattern reveals about the threat actor's behavior.
+**Objective:** Understand exactly when the attack started, how it evolved, and what the timing pattern reveals about the threat actor.
 
 ```kql
 SecurityEvent
@@ -162,16 +171,10 @@ SecurityEvent
 | Time | Attempts | Assessment |
 |---|---|---|
 | May 6, 2026 9:00 AM | 1 | Initial reconnaissance probe |
-| May 7, 2026 12:00 PM | 2 | Follow-up probing |
+| May 7, 2026 12:00 PM | 2 | Follow-up verification |
 | May 7, 2026 2:00 AM | 52 | Full brute force assault |
 
-**Critical Finding:** This timeline reveals a classic automated attack progression:
-
-1. **Reconnaissance** — Single probe on May 6th to confirm the machine was alive and responding
-2. **Verification** — Two attempts on May 7th afternoon to test response
-3. **Full assault** — 52 attempts at 2:00 AM when network traffic is low and detection response is slower
-
-The 2AM timing is a well-known pattern in automated attack campaigns. Botnets deliberately schedule heavy attack activity during off-hours to avoid real-time detection and response. This timing behavior alone is a strong indicator of sophisticated automated tooling rather than a casual attacker.
+**Critical Finding:** Classic automated attack progression. Single probe to confirm the machine was alive. Follow-up verification. Full assault at 2AM when network traffic is low and detection response is slower. The 2AM timing is a well-known pattern in automated botnet campaigns.
 
 ---
 
@@ -191,18 +194,16 @@ SecurityEvent
 | Source IP | Attempts | Assessment |
 |---|---|---|
 | 45.142.193.145 | 55 | Primary attacker — confirmed malicious |
-| 67.161.220.109 | 12 | Analyst activity — RDP sessions |
+| 67.161.220.109 | 19 | Analyst activity — RDP sessions |
+| 137.184.111.6 | 1 | Secondary threat actor — surfaced by workbook |
 
 ---
 
 ## Phase 5 — Threat Intelligence Enrichment
 
-**Objective:** Enrich the investigation by looking up the attacking IP in a global threat intelligence database to determine whether this is a known malicious actor.
+**Objective:** Enrich the investigation by looking up attacking IPs in a global threat intelligence database.
 
-**Tool used:** AbuseIPDB (abuseipdb.com)
-**IP investigated:** 45.142.193.145
-
-**AbuseIPDB Results:**
+### IP 1 — 45.142.193.145
 
 | Field | Value |
 |---|---|
@@ -210,13 +211,24 @@ SecurityEvent
 | Abuse Confidence | 100% |
 | ISP | Limited Network LTD |
 | Usage Type | Data Center / Web Hosting / Transit |
-| ASN | AS214295 |
 | Country | Netherlands |
 | City | Amsterdam, North Holland |
 
-**Finding:** This IP has been reported 353 times by security teams and researchers worldwide with 100% confidence of abuse. The data center / web hosting usage type confirms this is rented VPS infrastructure — commonly used to host automated attack tooling and botnets.
+**Assessment:** Confirmed malicious data center infrastructure. Rented VPS commonly used to host automated brute force tooling. 353 reports from security teams worldwide.
 
-This is not a casual attacker. This is confirmed malicious infrastructure that has been flagged by hundreds of organizations globally.
+### IP 2 — 137.184.111.6
+
+| Field | Value |
+|---|---|
+| Reports | 390 |
+| Abuse Confidence | 100% |
+| ISP | DigitalOcean, LLC |
+| Usage Type | Data Center / Web Hosting / Transit |
+| Hostname | prod-boron-nyc1-4.do.binaryedge.ninja |
+| Country | United States |
+| City | North Bergen, New Jersey |
+
+**Assessment:** BinaryEdge internet scanning infrastructure. BinaryEdge continuously scans the entire internet mapping exposed services. This IP probed the VM on May 8th — surfaced by the Sentinel Workbook during the monitoring phase.
 
 **Analyst Note:** Threat intelligence enrichment is a standard SOC workflow. When an alert fires with a suspicious IP, analysts look it up in threat intel platforms like AbuseIPDB, VirusTotal, or Shodan to determine whether the IP is a known bad actor. This context directly influences severity assessment and response decisions.
 
@@ -224,7 +236,7 @@ This is not a casual attacker. This is confirmed malicious infrastructure that h
 
 ## Phase 6 — Failed vs Successful Login Correlation
 
-**Objective:** Determine whether the attacking IP successfully authenticated after the brute force attempts — the key question in any brute force investigation.
+**Objective:** Determine whether any attacking IP successfully authenticated after brute force attempts.
 
 ```kql
 SecurityEvent
@@ -238,19 +250,17 @@ SecurityEvent
 | IpAddress | EventID | EventCount | Assessment |
 |---|---|---|---|
 | — | 4624 | 174 | Internal system logons |
-| 45.142.193.145 | 4625 | 55 | Failed attempts only |
+| 45.142.193.145 | 4625 | 55 | Failed attempts only — no compromise |
 | 67.161.220.109 | 4625 | 12 | Analyst RDP failures |
 | 67.161.220.109 | 4624 | 6 | Analyst successful RDP sessions |
 
-**Critical Finding:** IP 45.142.193.145 shows 55 failed attempts and **zero successful logons**. The brute force attack completely failed. The VM was not compromised.
-
-The 174 successful logons with no external IP are internal system processes and service accounts — assessed as legitimate after logon type analysis.
+**Critical Finding:** IP 45.142.193.145 shows 55 failed attempts and zero successful logons. The brute force attack completely failed. The VM was not compromised.
 
 ---
 
 ## Phase 7 — Logon Type Analysis
 
-**Objective:** Use logon type data to determine what service or process the attacker was targeting — answering the question of whether this was an application-level attack or a direct OS authentication attack.
+**Objective:** Use logon type data to determine what service the attacker was targeting.
 
 ```kql
 SecurityEvent
@@ -267,18 +277,13 @@ SecurityEvent
 | Type 7 | 6 | Unlock |
 | Type 10 | 3 | Remote Interactive (RDP) |
 
-**Investigation Conclusion:** The logon type distribution directly answers what service was being targeted.
-
-- **Type 3 (86% of attempts)** = Network authentication — the attacker was hitting Windows network authentication services directly, not a web application, not SQL Server, not a specific business application. This is consistent with SMB or NTLM-based credential attacks targeting the OS authentication layer.
-- **Type 10 (3 attempts)** = These were my own RDP sessions from my Mac — not attacker activity.
-
-This finding changes the remediation priority. The primary response should focus on restricting network authentication exposure (SMB, NTLM hardening) rather than solely RDP controls.
+**Investigation Conclusion:** Type 3 network logons (86% of attempts) indicate the attacker was hitting Windows network authentication services directly — not a web application, not SQL Server, not a specific business application. This is consistent with SMB or NTLM-based attacks targeting the OS authentication layer. The Type 10 failures were my own RDP sessions from my Mac — not attacker activity. This finding changes the remediation priority toward restricting network authentication exposure rather than solely RDP controls.
 
 ---
 
-## Phase 8 — Detection Engineering
+## Phase 8 — Detection Engineering (Defender)
 
-**Objective:** Build a custom detection rule that would automatically alert on this behavior in the future with proper MITRE ATT&CK mapping and actionable response guidance.
+**Objective:** Build a custom detection rule in Microsoft Defender to automatically alert on brute force behavior.
 
 **Detection Rule Configuration:**
 
@@ -299,11 +304,6 @@ SecurityEvent
 | where FailedAttempts > 10
 ```
 
-**Detection Logic:** Flags any source IP generating more than 10 failed logon attempts within a 5-minute window. Threshold calibrated to catch automated tooling while avoiding false positives from users mistyping passwords.
-
-**Alert Description:**
-> Microsoft Sentinel detected excessive failed authentication attempts from a single source IP within a short time window. This may indicate brute force or password spraying activity targeting Windows accounts.
-
 **Recommended Response Actions:**
 1. Look up source IP in AbuseIPDB and VirusTotal
 2. Correlate Event ID 4624 against 4625 to check for successful logons
@@ -316,8 +316,6 @@ SecurityEvent
 ---
 
 ## Phase 9 — Incident Response & Triage
-
-**Objective:** Triage the incident generated by the detection rule and document the full investigation workflow.
 
 **Incident Details:**
 
@@ -338,11 +336,11 @@ SecurityEvent
 
 **Step 2 — Threat Intel Check:** Looked up 45.142.193.145 on AbuseIPDB. 353 reports, 100% abuse confidence. Confirmed malicious infrastructure.
 
-**Step 3 — Severity Assessment:** Rated High based on confirmed malicious IP, 55 attempts, targeting of default admin account, and 2AM timing pattern consistent with automated attack campaigns.
+**Step 3 — Severity Assessment:** Rated High based on confirmed malicious IP, 55 attempts, targeting of default admin account, and 2AM timing consistent with automated botnet activity.
 
-**Step 4 — Compromise Assessment:** Correlated 4624 vs 4625 for attacking IP. Zero successful logons from 45.142.193.145. Attack failed. No compromise.
+**Step 4 — Compromise Assessment:** Correlated 4624 vs 4625 for attacking IP. Zero successful logons. Attack failed. No compromise.
 
-**Step 5 — Service Identification:** Logon type 3 confirmed attacker was targeting Windows network authentication — not a specific application.
+**Step 5 — Service Identification:** Logon type 3 confirmed attacker targeted Windows network authentication directly — not a specific application.
 
 **Step 6 — Scope Assessment:** Attack isolated to single IP targeting single VM. No lateral movement. No internal propagation.
 
@@ -352,9 +350,7 @@ SecurityEvent
 
 ## Phase 10 — Endpoint Threat Hunting
 
-**Objective:** Pivot from authentication analysis to endpoint telemetry to confirm no command execution occurred — ruling out alternative compromise vectors beyond the brute force attempt.
-
-**Analyst Reasoning:** Even with no successful logons from the attacking IP, a thorough investigation requires checking whether any process execution occurred via a different attack vector.
+**Objective:** Pivot from authentication analysis to endpoint telemetry to rule out post-authentication execution.
 
 ```kql
 SecurityEvent
@@ -370,9 +366,115 @@ SecurityEvent
 |---|---|---|---|---|
 | May 6, 2026 8:00 AM | WORKGROUP\win-sec-eve | win-sec-events | C:\Windows\System32\cmd.exe | cmd.exe |
 
-**Assessment:** Single cmd.exe execution under local system account during morning hours. No suspicious command line arguments. Timing and account context consistent with normal system or scheduled task activity. Assessed as benign.
+**Assessment:** Single cmd.exe execution under local system account during morning hours. No suspicious command line arguments. Timing and account context consistent with normal system activity. Assessed as benign.
 
-**Analyst Note:** In a production environment this would be cross-referenced against the change management calendar and confirmed with system administrators.
+---
+
+## Phase 11 — Sentinel Analytics Rules
+
+**Objective:** Build native Sentinel Analytics Rules to provide SIEM-level detection coverage beyond Defender custom detections.
+
+### Rule 1 — Brute Force Detection (High Severity)
+
+| Setting | Value |
+|---|---|
+| Name | Brute Force Detection — Excessive Failed Logons From Single IP |
+| Severity | High |
+| MITRE | T1110 — Brute Force / Credential Access |
+| Frequency | Every 5 minutes |
+| Lookback | 5 minutes |
+| Status | Enabled |
+
+```kql
+SecurityEvent
+| where EventID == 4625
+| summarize FailedAttempts=count() by IpAddress, bin(TimeGenerated, 5m)
+| where FailedAttempts > 10
+| extend ThreatLevel = "High"
+| extend MITRETechnique = "T1110 - Brute Force"
+| extend AttackVector = "Network Authentication"
+```
+
+### Rule 2 — Low and Slow Brute Force Detection (Medium Severity)
+
+Built specifically to address the detection gap identified in the initial investigation — attackers who stay under the 10-attempt threshold to evade fast detection rules.
+
+| Setting | Value |
+|---|---|
+| Name | Low and Slow Brute Force Detection |
+| Severity | Medium |
+| MITRE | T1110 — Brute Force / Credential Access |
+| Frequency | Every 1 hour |
+| Lookback | 1 hour |
+| Status | Enabled |
+
+```kql
+SecurityEvent
+| where EventID == 4625
+| summarize FailedAttempts=count() by IpAddress, bin(TimeGenerated, 1h)
+| where FailedAttempts between (3 .. 9)
+| extend ThreatLevel = "Medium"
+| extend DetectionType = "Low and Slow Brute Force"
+| extend MITRETechnique = "T1110 - Brute Force"
+```
+
+**Detection Logic:** Catches IPs making 3-9 attempts per hour — staying just under the fast detection threshold but still exhibiting suspicious behavior over time. Together these two rules provide layered coverage across fast and slow attack patterns.
+
+**Active Rules Dashboard:** 2 active rules — High (1), Medium (1) — both mapped to T1110, both Credential Access.
+
+---
+
+## Phase 12 — Threat Intelligence Watchlist
+
+**Objective:** Build a Sentinel Watchlist of confirmed malicious IPs so they are automatically flagged on any future activity across the environment.
+
+**Watchlist:** Malicious-IPs
+**Items:** 1 (45.142.193.145)
+
+**Watchlist Query:**
+```kql
+let MaliciousIPs = _GetWatchlist('Malicious-IPs')
+| project IPAddress;
+SecurityEvent
+| where IpAddress in (MaliciousIPs)
+| project TimeGenerated, EventID, IpAddress, TargetUserName, LogonType
+| sort by TimeGenerated desc
+```
+
+**Results:** 55 items returned — every single event from the confirmed malicious IP automatically flagged. All Event ID 4625, all LogonType 3, all targeting automated wordlist accounts, all timestamped during the 2AM attack window.
+
+**Why this matters:** In a real SOC environment, watchlists allow analysts to automatically surface known bad actors across all future alerts without manually looking up every IP. Once an IP is confirmed malicious it gets added to the watchlist and flagged automatically on every future event.
+
+---
+
+## Phase 13 — Sentinel Workbook & Second Threat Actor Discovery
+
+**Objective:** Build a Sentinel Workbook to visualize attack data and support ongoing monitoring. The workbook surfaced a second threat actor not identified during the initial investigation.
+
+**Workbook Query:**
+```kql
+SecurityEvent
+| where EventID == 4625
+| summarize FailedAttempts=count() by IpAddress
+| sort by FailedAttempts desc
+| render barchart
+```
+
+**Workbook Results:**
+
+| IP Address | Failed Attempts | Assessment |
+|---|---|---|
+| 45.142.193.145 | 55 | Primary attacker — previously investigated |
+| 67.161.220.109 | 19 | Analyst activity — RDP sessions |
+| 137.184.111.6 | 1 | NEW — second threat actor discovered |
+
+**New Finding:** IP 137.184.111.6 was not identified during the initial investigation. The Workbook visualization surfaced it automatically. Investigation confirmed:
+- Event ID 4625, LogonType 3, May 8, 2026 9:58 AM
+- AbuseIPDB: 390 reports, 100% abuse confidence
+- DigitalOcean infrastructure — BinaryEdge internet scanner
+- North Bergen, New Jersey
+
+This demonstrates exactly why continuous monitoring and visualization matters in SOC environments — dashboards surface things you didn't know to look for.
 
 ---
 
@@ -384,52 +486,37 @@ SecurityEvent
 **Severity:** High → Medium (post-investigation)
 **Status:** Closed — No Compromise Confirmed
 
----
-
 ### Executive Summary
 
-On May 7, 2026 at 2:55 AM, an automated threat actor operating from IP 45.142.193.145 — a confirmed malicious data center host in Amsterdam with 353 AbuseIPDB reports and 100% abuse confidence — launched a brute force attack against the soc-lab Azure Windows Server VM.
-
-The attack began with a single reconnaissance probe on May 6th, followed by low-volume verification attempts, before escalating to 52 attempts in a single hour at 2AM — a timing pattern consistent with automated botnet activity designed to evade real-time detection.
-
-Investigation confirmed the attack was unsuccessful. No successful authentication from the attacking IP was observed. Logon type analysis identified the attack targeted Windows network authentication services (Type 3) directly — not a specific application. Endpoint threat hunting found no evidence of malicious process execution. The environment was not compromised.
-
----
+On May 7, 2026 at 2:55 AM, an automated threat actor operating from IP 45.142.193.145 — confirmed malicious infrastructure in Amsterdam with 353 AbuseIPDB reports and 100% abuse confidence — launched a brute force attack against the soc-lab Azure Windows Server VM. The attack began with a single reconnaissance probe on May 6th, followed by low-volume verification, before escalating to 52 attempts in one hour at 2AM — consistent with automated botnet behavior designed to evade real-time detection. Investigation confirmed no successful authentication. The environment was not compromised. A second threat actor (137.184.111.6) was subsequently identified via Sentinel Workbook monitoring.
 
 ### Attack Timeline
 
 | Time | Event |
 |---|---|
 | May 4, 2026 2:00 PM | Azure VM deployed, AMA connector configured |
-| May 6, 2026 9:00 AM | First reconnaissance probe from 45.142.193.145 (1 attempt) |
+| May 6, 2026 9:00 AM | First probe from 45.142.193.145 (1 attempt) |
 | May 7, 2026 12:00 PM | Follow-up verification (2 attempts) |
 | May 7, 2026 2:00 AM | Full brute force assault (52 attempts in 1 hour) |
 | May 7, 2026 6:52 PM | Detection rule fires — Incident IR-001 created |
 | May 7, 2026 6:52 PM | Investigation completed — no compromise confirmed |
-
----
+| May 8, 2026 9:58 AM | Second threat actor (137.184.111.6) probes VM |
+| May 8, 2026 | Workbook built — second IP surfaced automatically |
 
 ### Indicators of Compromise
 
 | Indicator | Type | Details | Disposition |
 |---|---|---|---|
-| 45.142.193.145 | Malicious IP | 55 failed logons, 353 AbuseIPDB reports, 100% abuse confidence, Amsterdam NL | Block at NSG |
+| 45.142.193.145 | Malicious IP | 55 failed logons, 353 AbuseIPDB reports, 100% confidence, Amsterdam NL | Block at NSG |
+| 137.184.111.6 | Malicious IP | 1 probe, 390 AbuseIPDB reports, 100% confidence, BinaryEdge scanner NJ | Block at NSG |
 | administrator | Targeted account | 14 failed attempts | Review, enforce MFA |
-| scanner / scans / scan | Wordlist accounts | 13 attempts each, accounts don't exist | Confirms automated tooling |
-
----
-
-### Root Cause
-
-Internet-exposed Windows Server VM with network authentication services accessible from the public internet. Automated scanning infrastructure probed and targeted the VM within 24 hours of deployment.
-
----
+| scanner / scans / scan | Wordlist accounts | 13 attempts each — accounts don't exist | Confirms automated tooling |
 
 ### Recommendations
 
 | Priority | Action |
 |---|---|
-| Immediate | Block 45.142.193.145 at the Azure NSG level |
+| Immediate | Block 45.142.193.145 and 137.184.111.6 at the Azure NSG level |
 | Short term | Restrict SMB and NTLM exposure to known IP ranges |
 | Short term | Enable MFA on all accounts with network logon permissions |
 | Short term | Enforce NTLMv2, disable NTLM where possible |
@@ -439,36 +526,58 @@ Internet-exposed Windows Server VM with network authentication services accessib
 
 ---
 
+## Full Threat Actor Summary
+
+| IP | Attempts | AbuseIPDB Reports | Confidence | Location | Infrastructure | Attack Type |
+|---|---|---|---|---|---|---|
+| 45.142.193.145 | 55 | 353 | 100% | Amsterdam, Netherlands | Limited Network LTD | Automated brute force botnet |
+| 137.184.111.6 | 1 | 390 | 100% | New Jersey, USA | DigitalOcean / BinaryEdge | Internet scanning |
+
+Both confirmed malicious. Both data center infrastructure. Both Type 3 network logon attacks targeting Windows network authentication directly.
+
+---
+
+## Detection Program Summary
+
+| Detection | Platform | Severity | Technique | Coverage |
+|---|---|---|---|---|
+| Excessive Failed Logons From Single IP | Microsoft Defender | High | T1110 | Fast brute force — 10+ attempts in 5 min |
+| Brute Force Detection — Excessive Failed Logons | Sentinel Analytics | High | T1110 | Fast brute force — 10+ attempts in 5 min |
+| Low and Slow Brute Force Detection | Sentinel Analytics | Medium | T1110 | Slow attacks — 3-9 attempts per hour |
+| Malicious-IPs Watchlist | Sentinel Watchlist | N/A | N/A | Known bad IP automatic flagging |
+
+Four detection layers covering fast attacks, slow attacks, and known malicious infrastructure — across both Defender and Sentinel.
+
+---
+
 ## What This Detection Misses
 
-A strong analyst thinks critically about the limits of their own detections. This rule has known gaps:
+**Low and slow attacks below 3 attempts per hour** — An attacker making 1-2 attempts per hour over several days would evade even the low and slow rule. User behavior analytics would be needed.
 
-**Low and slow attacks** — An attacker making 2-3 attempts per hour over several days would never hit the 10-failure-in-5-minutes threshold. A longer lookback window with a lower threshold would be needed to catch this.
+**Distributed password spraying** — Spraying from many IPs with few attempts each would evade all single-IP threshold rules. Multi-source correlation detection would be required.
 
-**Distributed password spraying** — An attacker spraying one password across many accounts from many different IPs would never trigger a single-IP threshold rule. Detecting this requires user-based anomaly detection across multiple source IPs.
+**Credential stuffing from rotating IPs** — Botnets rotating IPs with each attempt would never trigger per-IP thresholds.
 
-**Credential stuffing from rotating IPs** — Botnets that rotate source IPs with each attempt would evade this detection entirely. Each IP would only generate 1-2 attempts — well below threshold.
+**Post-authentication activity** — These detections catch the brute force attempt but not what happens after a successful login. A separate rule correlating 4624 followed by 4688 within a short window would be needed.
 
-**Post-authentication activity** — This rule catches the brute force attempt but not what happens after a successful login. A separate detection correlating Event ID 4624 followed by 4688 (process creation) within a short window would be needed to catch successful compromise followed by execution.
-
-**2AM timing gap** — The attack began at 2:55 AM and the incident wasn't created until 6:52 PM — a 16-hour gap. In a real environment an on-call SOC analyst or automated SOAR response would need to close this gap.
+**16-hour detection gap** — First attack activity at 2:55 AM, incident created at 6:52 PM. In production an on-call analyst or automated SOAR response would need to close this gap.
 
 ---
 
 ## Key Takeaways
 
-- A real external threat actor found and attacked this VM within 24 hours of deployment — no simulation required
-- The attacking IP was confirmed malicious via AbuseIPDB — 353 global reports, 100% abuse confidence
+- Two real external threat actors found and attacked this VM — no simulation required
+- Both attacking IPs confirmed malicious via AbuseIPDB — 353 and 390 global reports respectively
 - Attack timing (2AM escalation) matched known botnet behavior patterns
-- Logon type analysis was the key to identifying what service was being targeted — Type 3 network logons confirmed OS-level network authentication attack, not an application-level attack
-- Separating analyst-generated activity (Type 10 RDP from my Mac) from real attacker activity (Type 3 network from external IP) is a fundamental SOC skill
-- The brute force attack failed completely — zero successful logons from the attacking IP
-- Threat intelligence enrichment transformed a suspicious IP into a confirmed known threat actor
+- Logon type analysis was the key to identifying what service was targeted — Type 3 confirmed OS-level network authentication attack
+- Separating analyst activity (Type 10 RDP) from real attacker activity (Type 3 network) is a fundamental SOC skill
+- The brute force attack failed completely — zero successful logons from either attacking IP
+- Sentinel Workbook visualization surfaced a second threat actor not found during manual investigation
+- Layered detection coverage — fast and slow attack rules — addresses known evasion techniques
 
 ---
 
-*Built by Nawid Farani — CS Student at Western Governors University | Security+ | AWS SAA | Splunk Core*
+*Built by Nawid Farani — CS Student at Western Governors University*
+*Security+ | AWS Solutions Architect Associate | Splunk Core Certified User*
 *Actively seeking Tier 1 SOC roles in Utah*
 *linkedin.com/in/nawid6 | github.com/nawidtechlabs*
-| Incident Documentation | Full IR report with timeline, IOCs, root cause, recommendations |
-| Detection Gap Analysis | Identified 4 specific evasion techniques this detection would miss |
